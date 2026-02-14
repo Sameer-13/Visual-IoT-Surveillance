@@ -296,7 +296,7 @@ class ArducamClass(object):
                     self.wrSensorReg16_8(0x3818, 0xa8)
                     self.wrSensorReg16_8(0x3621, 0x10)
                     self.wrSensorReg16_8(0x3801, 0xb0)
-                    self.wrSensorReg16_8(0x4407, 0x04)
+                    self.wrSensorReg16_8(0x4407, 0x20)
                 else:
                     self.wrSensorReg16_8(0x4740, 0x21)
                     self.wrSensorReg16_8(0x501e, 0x2a)
