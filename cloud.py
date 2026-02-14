@@ -7,7 +7,7 @@ from tkinter import ttk
 from PIL import Image, ImageTk
 import io
 
-ESP_IP = "192.168.2.167"
+ESP_IP = "yyy.yyy.yyy.yyy"
 PORT = 4444
 
 # Shared frame buffer
