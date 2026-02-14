@@ -1,48 +1,27 @@
-# main.py (MicroPython on ESP32-S3)
-#
-# Visual IoT Surveillance System (Edge Client)
-# - Connect to WiFi
-# - Connect to PC "cloud" server via TCP port 4444
-# - Wait for commands: "START\n" and "STOP\n"
-# - When START: LED -> GREEN and stream JPEG frames
-# - When STOP:  LED -> RED and stop streaming
-#
-# Frame format sent to server (recommended):
-#   [4-byte big-endian length][JPEG bytes]
-#
-# Tested API usage follows your provided Arducam.py + main_example.py style:
-#   cam.capture()
-#   jpeg = cam.read_jpeg()
-
+from machine import Pin, SPI, I2C
 import time
 import socket
-import struct
 import network
+import ustruct
 import neopixel
-from machine import Pin, SPI, I2C
 
 from Arducam import (
-    Arducam, JPEG, OV5642, OV2640,
-    ARDUCHIP_TIM
+    Arducam, JPEG, OV5642,
+    ARDUCHIP_TRIG, CAP_DONE_MASK, ARDUCHIP_TIM
 )
 
-# ---------- USER SETTINGS ----------
+# ----------------------------
+# Client/Server Configuration
+# ----------------------------
 WIFI_SSID = "Sm13"
 WIFI_PASS = "sam2003wm"
 
-SERVER_IP   = "192.168.1.15"   # <-- change to your PC IP
+SERVER_IP = "192.168.2.171"
 SERVER_PORT = 4444
 
-CAMERA_TYPE = OV5642
-
-# Limit JPEG to reduce MemoryError risk (Arducam default is 256KB)
-MAX_JPEG_BYTES = 120 * 1024
-
-# Target frames per second (approx). Increase if your link is fast.
-TARGET_FPS = 8
-# ----------------------------------
-
-# Pins (match your provided main_example.py)
+# ----------------------------
+# Board/Camera Configuration
+# ----------------------------
 SPI_ID   = 2
 SPI_SCK  = 12
 SPI_MOSI = 10
@@ -53,212 +32,179 @@ I2C_ID   = 0
 I2C_SCL  = 14
 I2C_SDA  = 13
 
-# NeoPixel built-in LED used in your example (Pin 38, 1 pixel)
-# If your board doesn't have NeoPixel there, switch to a normal Pin LED.
-led = neopixel.NeoPixel(Pin(38), 1)
+LED_PIN = 38
+led = neopixel.NeoPixel(Pin(LED_PIN), 1)
 
-def led_off():
-    led[0] = (0, 0, 0)
+# ----------------------------
+# Payload Configuration
+# ----------------------------
+MAX_PAYLOAD = 1200  # safe size to avoid UDP fragmentation
+
+# ----------------------------
+# Helper Function
+# ----------------------------
+def led_set(r, g, b):
+    led[0] = (r, g, b)
     led.write()
+    
+# ----------------------------
+# Networking Functions
+# ----------------------------
 
-def led_red():
-    led[0] = (255, 0, 0)
-    led.write()
-
-def led_green():
-    led[0] = (0, 255, 0)
-    led.write()
-
-
-def connect_wifi(ssid: str, password: str) -> str:
-    """Connect to WiFi and return IP address."""
+def wifi_connect(ssid, password, timeout_s=20):
+    print("Connecting WiFi...")
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
 
-    if not wlan.isconnected():
-        print("Connecting to WiFi...")
-        wlan.connect(ssid, password)
+    wlan.connect(ssid, password)
 
-        t0 = time.ticks_ms()
-        while not wlan.isconnected():
-            if time.ticks_diff(time.ticks_ms(), t0) > 20000:
-                raise RuntimeError("WiFi connect timeout")
-            time.sleep(0.2)
+    t0 = time.ticks_ms()
+    while True:
+        if wlan.isconnected():
+            break
+        if time.ticks_diff(time.ticks_ms(), t0) > timeout_s * 1000:
+            raise RuntimeError("WiFi connect timeout")
+        time.sleep(0.2)
 
     ip = wlan.ifconfig()[0]
-    print("WiFi connected, IP =", ip)
-    return ip
+    print("WiFi OK. IP:", ip)
+    return wlan
 
+def sock_send_all(sock, data):
+    # MicroPython sockets may not have sendall on all ports, so we loop.
+    mv = memoryview(data)
+    total = 0
+    while total < len(data):
+        sent = sock.send(mv[total:])
+        if sent is None or sent == 0:
+            raise OSError("Socket send failed")
+        total += sent
 
-def init_camera():
-    """Initialize SPI/I2C and Arducam camera."""
+def recv_line(sock, max_len=64):
+    """
+    Read a command line that ends with '\n'.
+    Returns the line without trailing whitespace, or None if nothing received.
+    """
+    try:
+        data = sock.recv(max_len)
+    except OSError:
+        return None
+
+    if not data:
+        # connection closed
+        raise OSError("Socket closed by server")
+
+    # handle cases where multiple commands arrive together
+    # we only care about START/STOP, so just search inside:
+    text = data.decode("ascii", "ignore").upper()
+    if "START" in text:
+        return "START"
+    if "STOP" in text:
+        return "STOP"
+    return None
+
+def send_frame_chunks(sock, server_ip, port, jpeg, frame_id):
+    total = (len(jpeg) + MAX_PAYLOAD - 1) // MAX_PAYLOAD
+    for chunk_id in range(total):
+        start = chunk_id * MAX_PAYLOAD
+        end = min(start + MAX_PAYLOAD, len(jpeg))
+        payload = jpeg[start:end]
+
+        # type(1)=0x01, frame_id(2), chunk_id(2), total(2), payload_len(2)
+        header = b"\x01" + ustruct.pack(">HHHH", frame_id, chunk_id, total, len(payload))
+        sock.sendto(header + payload, (server_ip, port))
+
+# ----------------------------
+# Camera Initialization + Capturing
+# ----------------------------
+def camera_init():
+    print("Initializing camera...")
     spi = SPI(
         SPI_ID,
-        baudrate=8_000_000,
-        polarity=0,
-        phase=0,
+        baudrate=2_000_000,
+        polarity=0, phase=0,
         sck=Pin(SPI_SCK),
         mosi=Pin(SPI_MOSI),
         miso=Pin(SPI_MISO),
     )
     i2c = I2C(I2C_ID, scl=Pin(I2C_SCL), sda=Pin(I2C_SDA), freq=400_000)
+    print("I2C scan:", [hex(x) for x in i2c.scan()])
 
     cam = Arducam(spi=spi, cs_pin=CS_PIN, i2c=i2c)
-    cam.CameraType = CAMERA_TYPE
+    cam.CameraType = OV5642
     cam.Set_Camera_mode(JPEG)
 
-    # Detect + init
     cam.Camera_Detection()
     cam.Spi_Test(retries=5)
     cam.init()
-
-    # # Reduce memory risk
-    # try:
-    #     cam.set_max_jpeg_size(MAX_JPEG_BYTES)
-    # except Exception:
-    #     pass
-
-    # This timing bit was necessary in your example (VSYNC active-low)
-    try:
-        cam.Spi_write(ARDUCHIP_TIM, 0x02)
-    except Exception:
-        pass
-
     time.sleep(0.2)
-    print("Camera initialized.")
+
+    # Important (from your example): VSYNC active-low timing bit
+    cam.Spi_write(ARDUCHIP_TIM, 0x02)
+    time.sleep(0.05)
+
+    print("Camera ready.")
     return cam
 
-
-def connect_server(ip: str, port: int) -> socket.socket:
-    """Connect to the cloud server via TCP."""
-    print("Connecting to server %s:%d ..." % (ip, port))
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(2.0)
-    s.connect((ip, port))
-    s.settimeout(2.0)
-    print("Connected to server.")
-    return s
-
-
-def recv_line(sock: socket.socket) -> bytes:
+def capture_jpeg(cam, timeout_ms=3000):
     """
-    Read until '\n'. Keeps it simple for START/STOP commands.
-    Returns b'' on disconnect.
+    Capture one JPEG frame and return bytes.
+    Includes a timeout so it doesn't hang forever.
     """
-    buf = bytearray()
-    while True:
-        try:
-            b = sock.recv(1)
-        except OSError:
-            return b""
-        if not b:
-            return b""
-        buf += b
-        if b == b"\n":
-            return bytes(buf)
+    cam.flush_fifo()
+    cam.clear_fifo_flag()
+    cam.start_capture()
 
+    t0 = time.ticks_ms()
+    while not cam.get_bit(ARDUCHIP_TRIG, CAP_DONE_MASK):
+        if time.ticks_diff(time.ticks_ms(), t0) > timeout_ms:
+            return b""
+        time.sleep(0.005)
 
-def capture_jpeg(cam) -> bytes:
-    """Capture one JPEG frame using Arducam API."""
-    cam.capture()
-    jpeg = cam.read_jpeg(max_size=MAX_JPEG_BYTES)
+    jpeg = cam.read_jpeg(max_size=None)
     return jpeg
 
-
-def send_frame(sock: socket.socket, jpeg: bytes) -> bool:
-    """Send one frame with 4-byte length prefix. Return False on failure."""
-    if not jpeg:
-        return True  # just skip empty frames
-    try:
-        sock.sendall(struct.pack(">I", len(jpeg)))
-        sock.sendall(jpeg)
-        return True
-    except OSError:
-        return False
-
-
+# ----------------------------
+# Main streaming loop
+# ----------------------------
 def main():
-    led_red()  # streaming must start OFF (RED)
+    led_set(255, 0, 0)  # RED idle
 
-    # 1) WiFi
-    connect_wifi(WIFI_SSID, WIFI_PASS)
+    wifi_connect(WIFI_SSID, WIFI_PASS)
+    cam = camera_init()
 
-    # 2) Camera
-    cam = init_camera()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) # UDP Socket
+    sock.bind(("0.0.0.0", SERVER_PORT))   # listen START/STOP
+    sock.settimeout(0.1)
+
+    print("UDP control ready on port", SERVER_PORT)
 
     streaming = False
-    sock = None
 
-    # Simple reconnect loop (useful during debugging)
     while True:
+        # Receive START/STOP
         try:
-            if sock is None:
-                sock = connect_server(SERVER_IP, SERVER_PORT)
-
-            # Wait for commands from server
-            cmd = recv_line(sock)
-            if cmd == b"":
-                raise OSError("Disconnected")
-
-            cmd = cmd.strip().upper()
-            if cmd == b"START":
+            data, addr = sock.recvfrom(64)
+            cmd = data.decode("ascii", "ignore").strip().upper()
+            if cmd == "START":
                 streaming = True
-                led_green()
-                print("START received -> streaming ON")
-
-            elif cmd == b"STOP":
+                led_set(0, 255, 0)
+                print("Streaming ON")
+            elif cmd == "STOP":
                 streaming = False
-                led_red()
-                print("STOP received -> streaming OFF")
+                led_set(255, 0, 0)
+                print("Streaming OFF")
+        except OSError:
+            pass
 
-            # If streaming is ON, send frames until STOP arrives
-            while streaming:
-                t0 = time.ticks_ms()
-
-                # Non-blocking-ish check for STOP while streaming:
-                # - Use short timeout; if nothing received, keep streaming.
-                try:
-                    sock.settimeout(0.001)
-                    maybe = sock.recv(16)
-                    if maybe:
-                        # If the server sent STOP\n during streaming, handle it
-                        if b"STOP" in maybe.upper():
-                            streaming = False
-                            led_red()
-                            print("STOP received -> streaming OFF")
-                            sock.settimeout(2.0)
-                            break
-                    sock.settimeout(2.0)
-                except OSError:
-                    sock.settimeout(2.0)
-
-                jpeg = capture_jpeg(cam)
-                ok = send_frame(sock, jpeg)
-                if not ok:
-                    raise OSError("Send failed")
-
-                # FPS control
-                frame_ms = time.ticks_diff(time.ticks_ms(), t0)
-                target_ms = int(1000 / max(1, TARGET_FPS))
-                if frame_ms < target_ms:
-                    time.sleep_ms(target_ms - frame_ms)
-
-        except Exception as e:
-            print("Error:", e)
-            streaming = False
-            led_red()
-
-            # Close socket and retry
-            try:
-                if sock:
-                    sock.close()
-            except Exception:
-                pass
-            sock = None
-
-            # Small backoff before reconnect
-            time.sleep(1)
-
+        # Stream frames if enabled
+        if streaming:
+            jpeg = capture_jpeg(cam, timeout_ms=3000)
+            if jpeg:
+                # frame packet: type + size + jpeg
+                packet = b"\x01" + ustruct.pack(">I", len(jpeg)) + jpeg
+                sock.sendto(packet, (SERVER_IP, SERVER_PORT))
+            time.sleep(0.05)
 
 # Run
 main()
