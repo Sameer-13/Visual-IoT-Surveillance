@@ -5,7 +5,15 @@ A MicroPython-based video streaming system using Arducam Mini 5MP Plus (OV5642) 
 ## Overview
 
 This project streams JPEG frames from an ESP32-S3 with Arducam camera over UDP to a desktop application with a simple GUI for viewing the live feed.
+<p align="center">
+  <img width="541" height="386" alt="image"
+       src="https://github.com/user-attachments/assets/211d730f-f27c-486e-a830-6c6dd7eb4e4d" />
+</p>
 
+<p align="center">
+  <img width="1467" height="815" alt="image"
+       src="https://github.com/user-attachments/assets/6c7db6b8-5a46-4fac-b8e4-689827757e1f" />
+</p>
 
 ## Hardware Requirements
 
