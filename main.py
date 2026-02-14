@@ -13,10 +13,10 @@ from Arducam import (
 # ----------------------------
 # Client/Server Configuration
 # ----------------------------
-WIFI_SSID = "Sm13"
-WIFI_PASS = "sam2003wm"
+WIFI_SSID = "Network_name"
+WIFI_PASS = "secret_password"
 
-SERVER_IP = "192.168.2.171"
+SERVER_IP = "xxx.xxx.xxx.xxx"
 SERVER_PORT = 4444
 
 # ----------------------------
